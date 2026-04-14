@@ -1,0 +1,13 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Locust (loadgen/)
+loadgen/.venv/
+loadgen/__pycache__/
+*.pyc
