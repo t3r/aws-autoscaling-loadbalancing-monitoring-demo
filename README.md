@@ -77,7 +77,7 @@ AWS CDK (TypeScript) project that provisions a **demo HTTP stack**: an **Applica
 | **Load generator** | Standalone **m5.large** with **Locust** in a **venv**, **systemd** service, `--web-host 0.0.0.0`, target URL = **ALB** from `/opt/locust/locust.env`. |
 | **Tagging** | Stack tags + propagated tags: `t3r:training`, `t3r:purpose`, `t3r:remove-after` (see `lib/autoscaling-demo-stack.ts`). |
 
-**Costs (high level)**  
+**Costs (high level)**
 You pay for **EC2**, **EBS**, **ALB**, **data transfer**, **CloudWatch** (dashboard / custom metrics / alarms), **SNS**, and the **m5 Locust** instance. **NAT gateways are not** used in this VPC layout.
 
 ---
@@ -86,7 +86,7 @@ You pay for **EC2**, **EBS**, **ALB**, **data transfer**, **CloudWatch** (dashbo
 
 - **Node.js** and **npm**
 - **AWS CLI** configured with credentials and a default region (or explicit env)
-- **CDK bootstrap** once per account/region:  
+- **CDK bootstrap** once per account/region:
   `npx cdk bootstrap aws://ACCOUNT/REGION`
 
 ---
@@ -130,7 +130,7 @@ or an explicit account/region pair.
 
 The **Locust** instance security group is created with **no inbound rules** (outbound is open). Add rules as needed, for example:
 
-- **TCP 8089** from **your IP** / office / VPN CIDR → use the Locust **web UI** from your laptop:  
+- **TCP 8089** from **your IP** / office / VPN CIDR → use the Locust **web UI** from your laptop:
   `http://PUBLIC-DNS-OF-LOCUST-DRIVER:8089` (use **LocustInstancePublicDns** output)
 - Optionally **TCP 22** if you use SSH (not defined by this stack).
 
@@ -169,8 +169,8 @@ Goal: show that a **failed or unhealthy** app instance is **replaced** by the AS
 2. **Open the dashboard** (output **DashboardName**): watch **“Auto Scaling — instances in service”** (and optionally the **EC2** console filtered by this stack’s instances).
 
 3. **Break one app instance** (pick an instance that is **InService** behind the ALB), for example via **SSM Session Manager** (instances have **AmazonSSMManagedInstanceCore**):
-   - **Stop Apache** so health checks fail:  
-     `sudo systemctl stop httpd`  
+   - **Stop Apache** so health checks fail:
+     `sudo systemctl stop httpd`
      or **`sudo shutdown -h now`** if you want a harder failure (ASG will replace a terminated instance to satisfy capacity).
 
 4. **Watch** (2–5+ minutes depending on health check interval, grace, and replacement):
@@ -184,7 +184,9 @@ Goal: show that a **failed or unhealthy** app instance is **replaced** by the AS
 
 ### What you should see during load test
 
-- **CloudWatch dashboard**: the **math metric** rises with load; **GroupInServiceInstances** may increase when the **scale-out** alarm fires (**+3** per policy in the current code).
+- **CloudWatch dashboard**: the **math metric** rises with load;
+![CloudWatch dashboard](/img/dashboard.jpg)
+**GroupInServiceInstances** may increase when the **scale-out** alarm fires (**+3** per policy in the current code).
 - When load drops, the **scale-in** alarm can fire (**−1** per evaluation).
 - **SNS**: notifications on **ALARM** and **OK** for both alarms (if subscribed).
 
