@@ -1,6 +1,6 @@
 # autoscaling-demo
 
-AWS CDK (TypeScript) project that provisions a **demo HTTP stack**: an **Application Load Balancer** in front of an **Auto Scaling group** of **Amazon Linux 2023** instances running **Apache**, with **CloudWatch**–driven **step scaling**, an **operations dashboard**, **SNS notifications** for scaling alarms, and an optional **Locust** driver EC2 instance for load testing.
+AWS CDK (TypeScript) project that provisions a **demo HTTP stack**: an **Application Load Balancer** in front of an **Auto Scaling group** of **Amazon Linux 2023** instances running **Apache**, with **CloudWatch**–driven **step scaling**, an **operations dashboard**, **SNS notifications** for scaling alarms, and an optional **Locust** driver EC2 instance for load testing. You can optionally deploy **two copies of that stack in different regions** plus a **Route53 weighted DNS** stack that targets both ALBs with **per-endpoint HTTP health checks**, so DNS stops returning an unhealthy region after health checks fail.
 
 ---
 
@@ -112,15 +112,62 @@ env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT
 
 or an explicit account/region pair.
 
+### Multi-region + global Route53 (optional)
+
+When CDK context **`multiRegion`** is enabled (`true` in `cdk.json`, or `-c multiRegion=true` on the CLI — string values count as enabled), the app synthesizes **three** stacks:
+
+| Stack | Region (default) | Role |
+|--------|------------------|------|
+| `AutoscalingDemo-<primaryRegion>` | `eu-central-1` (see `bin/autoscaling-demo.ts` / context) | Full demo stack including the **Locust** driver (`enableLocustDriver` default). |
+| `AutoscalingDemo-<secondaryRegion>` | `eu-west-3` (see bin / context) | Same app tier (VPC, ASG, ALB, scaling, dashboard) **without** a Locust instance — load generation runs from the primary region only. |
+| `AutoscalingDemoGlobalDns` | `primaryRegion` (override with `dnsStackRegion`) | **Weighted A alias** records for `dnsRecordName` + `hostedZoneName`, each tied to a regional ALB and a **Route53 HTTP health check** on `http://<alb-dns>/`. |
+
+The primary stack’s Locust user data still targets the **primary regional ALB** by default. To load-test via the **global** hostname (both regions through Route53), SSH or SSM into the primary Locust instance and set `LOCUST_TARGET` in `/opt/locust/locust.env` to `http://YOUR-WEIGHTED-DNS-RECORD`, then `sudo systemctl restart locust.service`.
+
+**Required context** (when `multiRegion` is enabled):
+
+- **`account`** — 12-digit AWS account id (or set **`CDK_DEFAULT_ACCOUNT`** and omit `account` if your CLI provides it).
+- **`hostedZoneId`** — existing **public** hosted zone id (starts with `Z`).
+- **`hostedZoneName`** — zone apex name (e.g. `example.com`).
+
+**Optional context**: `primaryRegion`, `secondaryRegion`, `dnsStackRegion`, `dnsRecordName` (default subdomain `demo` → `demo.example.com`).
+
+All three stacks use **`crossRegionReferences: true`** so the DNS stack can reference ALBs in other regions (CDK publishes exports to **SSM**; bootstrap must be current in each involved region).
+
+**Bootstrap** (once per account **and** region used):
+
+```bash
+npx cdk bootstrap aws://ACCOUNT/PRIMARY_REGION
+npx cdk bootstrap aws://ACCOUNT/SECONDARY_REGION
+```
+
+**Deploy everything**:
+
+```bash
+npx cdk deploy --all \
+  -c multiRegion=true \
+  -c account=ACCOUNT \
+  -c hostedZoneId=Zxxxxxxxxxxxx \
+  -c hostedZoneName=example.com
+```
+
+Point your domain at the hosted zone’s **Route53 name servers** (if you have not already) so clients resolve `dnsRecordName.hostedZoneName` to the weighted record.
+
+**Output**: stack `AutoscalingDemoGlobalDns` exports **`WeightedDnsRecordFqdn`** (e.g. `demo.example.com`). Open `http://WeightedDnsRecordFqdn/` to hit whichever regional ALBs are **healthy**; with equal weights (50/50), traffic is split across healthy endpoints only. It also exports **`Route53HealthDashboardName`**: open that dashboard in **CloudWatch** to see **HealthCheckStatus** (1/0) and **HealthCheckPercentageHealthy** for each regional endpoint (metrics are read from **us-east-1** even if the dashboard stack lives elsewhere).
+
+**Simulating a regional failure**: stop or delete resources in one region until the ALB stops returning **2xx** on `/` (for example delete the stack in that region, remove the listener, or block the ALB security group). Route53 health checks flip to **unhealthy** after consecutive failures; that region’s **weighted record is omitted** from DNS responses, so clients converge on the surviving region (allow a few minutes for TTLs and health-check intervals).
+
 ### Useful outputs after deploy
 
 | Output | Meaning |
 |--------|---------|
 | **LoadBalancerDns** | Open `http://YOUR-ALB-DNS/` in a browser (use the output value). |
-| **DashboardName** | Open **CloudWatch → Dashboards →** this name. |
+| **DashboardName** | **CloudWatch → Dashboards**: HTTP load per instance, **Auto Scaling activity** (desired / in-service / pending / terminating), and scaling thresholds. |
 | **ScalingAlarmsTopicArn** | Subscribe (email/SMS) for scaling alarm **ALARM** / **OK**. |
-| **LocustInstancePublicDns** | Locust host DNS (after you open the SG). |
-| **LocustWebPort** | **8089** — Locust web UI. |
+| **LocustInstancePublicDns** | Locust host DNS (after you open the SG). Omitted when `enableLocustDriver` is false (multi-region **secondary** stack). |
+| **LocustWebPort** | **8089** — Locust web UI. Omitted when no Locust driver is deployed. |
+| **WeightedDnsRecordFqdn** | (Multi-region only) Hostname for the weighted global record — use `http://…/` in a browser. |
+| **Route53HealthDashboardName** | (Multi-region only) CloudWatch dashboard for **Route 53** health-check status and **% healthy** checkers per endpoint. |
 
 ---
 

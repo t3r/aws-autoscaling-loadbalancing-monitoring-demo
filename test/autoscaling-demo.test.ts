@@ -64,4 +64,13 @@ describe('AutoscalingDemoStack', () => {
     template.resourceCountIs('AWS::CloudWatch::Dashboard', 1);
     template.resourceCountIs('AWS::CloudWatch::Alarm', 2);
   });
+
+  test('enableLocustDriver false omits standalone Locust EC2 instance', () => {
+    const appNoLocust = new cdk.App();
+    const stackNoLocust = new AutoscalingDemoStack(appNoLocust, 'NoLocust', {
+      enableLocustDriver: false,
+    });
+    const t = Template.fromStack(stackNoLocust);
+    t.resourceCountIs('AWS::EC2::Instance', 0);
+  });
 });

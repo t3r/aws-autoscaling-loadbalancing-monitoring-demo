@@ -8,8 +8,19 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
 
+export interface AutoscalingDemoStackProps extends cdk.StackProps {
+  /**
+   * When false, no Locust driver EC2 is provisioned (use in secondary regions of a multi-region deploy).
+   * @default true
+   */
+  readonly enableLocustDriver?: boolean;
+}
+
 export class AutoscalingDemoStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  /** Regional ALB fronting the Auto Scaling group (for Route53 alias / multi-region DNS). */
+  public readonly webAlb: elbv2.ApplicationLoadBalancer;
+
+  constructor(scope: Construct, id: string, props?: AutoscalingDemoStackProps) {
     const trainingTags: Record<string, string> = {
       't3r:training': 'lobster',
       't3r:purpose': 'training',
@@ -19,6 +30,8 @@ export class AutoscalingDemoStack extends cdk.Stack {
       ...props,
       tags: { ...trainingTags, ...props?.tags },
     });
+
+    const enableLocustDriver = props?.enableLocustDriver !== false;
 
     for (const [key, value] of Object.entries(trainingTags)) {
       cdk.Tags.of(this).add(key, value, { applyToLaunchedInstances: true });
@@ -97,11 +110,12 @@ export class AutoscalingDemoStack extends cdk.Stack {
       }),
     });
 
-    const alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
+    this.webAlb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
       vpc,
       internetFacing: true,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
     });
+    const alb = this.webAlb;
 
     instanceSecurityGroup.connections.allowFrom(
       alb,
@@ -139,14 +153,39 @@ export class AutoscalingDemoStack extends cdk.Stack {
       period: loadMetricPeriod,
     });
 
+    const asgPeriod = cdk.Duration.minutes(1);
+    const asgDim = { AutoScalingGroupName: asg.autoScalingGroupName };
+
     const groupInServiceInstances = new cloudwatch.Metric({
       namespace: 'AWS/AutoScaling',
       metricName: 'GroupInServiceInstances',
-      dimensionsMap: {
-        AutoScalingGroupName: asg.autoScalingGroupName,
-      },
+      dimensionsMap: asgDim,
       statistic: cloudwatch.Stats.AVERAGE,
-      period: cdk.Duration.minutes(1),
+      period: asgPeriod,
+    });
+
+    const groupDesiredCapacity = new cloudwatch.Metric({
+      namespace: 'AWS/AutoScaling',
+      metricName: 'GroupDesiredCapacity',
+      dimensionsMap: asgDim,
+      statistic: cloudwatch.Stats.AVERAGE,
+      period: asgPeriod,
+    });
+
+    const groupPendingInstances = new cloudwatch.Metric({
+      namespace: 'AWS/AutoScaling',
+      metricName: 'GroupPendingInstances',
+      dimensionsMap: asgDim,
+      statistic: cloudwatch.Stats.AVERAGE,
+      period: asgPeriod,
+    });
+
+    const groupTerminatingInstances = new cloudwatch.Metric({
+      namespace: 'AWS/AutoScaling',
+      metricName: 'GroupTerminatingInstances',
+      dimensionsMap: asgDim,
+      statistic: cloudwatch.Stats.AVERAGE,
+      period: asgPeriod,
     });
 
     new cloudwatch.Dashboard(this, 'OperationsDashboard', {
@@ -166,8 +205,13 @@ export class AutoscalingDemoStack extends cdk.Stack {
         ],
         [
           new cloudwatch.GraphWidget({
-            title: 'Auto Scaling — instances in service',
-            left: [groupInServiceInstances],
+            title: 'Auto Scaling activity (desired vs in-service, pending, terminating)',
+            left: [
+              groupDesiredCapacity.with({ label: 'Desired capacity', color: cloudwatch.Color.BLUE }),
+              groupInServiceInstances.with({ label: 'In service', color: cloudwatch.Color.GREEN }),
+              groupPendingInstances.with({ label: 'Pending', color: cloudwatch.Color.ORANGE }),
+              groupTerminatingInstances.with({ label: 'Terminating', color: cloudwatch.Color.RED }),
+            ],
             width: 24,
             height: 6,
           }),
@@ -230,20 +274,21 @@ export class AutoscalingDemoStack extends cdk.Stack {
 
     const locustWebPort = 8089;
 
-    const locustDriverSecurityGroup = new ec2.SecurityGroup(this, 'LocustDriverSecurityGroup', {
-      vpc,
-      description: 'Locust driver',
-      allowAllOutbound: true,
-    });
+    if (enableLocustDriver) {
+      const locustDriverSecurityGroup = new ec2.SecurityGroup(this, 'LocustDriverSecurityGroup', {
+        vpc,
+        description: 'Locust driver',
+        allowAllOutbound: true,
+      });
 
-    const locustDriverRole = new iam.Role(this, 'LocustDriverRole', {
-      assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
-      ],
-    });
+      const locustDriverRole = new iam.Role(this, 'LocustDriverRole', {
+        assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
+        managedPolicies: [
+          iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
+        ],
+      });
 
-    const locustPy = `from locust import HttpUser, task, between
+      const locustPy = `from locust import HttpUser, task, between
 
 
 class AlbDemoUser(HttpUser):
@@ -254,7 +299,7 @@ class AlbDemoUser(HttpUser):
         self.client.get("/", name="GET /")
 `;
 
-    const locustSystemdUnit = `[Unit]
+      const locustSystemdUnit = `[Unit]
 Description=Locust load generator (web UI + workers on this host)
 After=network-online.target
 Wants=network-online.target
@@ -270,38 +315,49 @@ RestartSec=5
 WantedBy=multi-user.target
 `;
 
-    const locustUserData = ec2.UserData.forLinux();
-    locustUserData.addCommands(
-      'set -euxo pipefail',
-      // Isolated venv avoids pip trying to uninstall RPM-owned setuptools on the system interpreter.
-      // Locust pulls gevent etc.; wheels may fall back to source builds without a C toolchain.
-      'dnf -y install python3 python3-pip gcc make python3-devel openssl-devel',
-      'mkdir -p /opt/locust',
-      'python3 -m venv /opt/locust/venv',
-      '/opt/locust/venv/bin/pip install --upgrade pip',
-      '/opt/locust/venv/bin/pip install "locust>=2.24,<3"',
-      `echo "LOCUST_TARGET=http://${alb.loadBalancerDnsName}" > /opt/locust/locust.env`,
-      `echo '${Buffer.from(locustPy, 'utf-8').toString('base64')}' | base64 -d > /opt/locust/locustfile.py`,
-      `echo '${Buffer.from(locustSystemdUnit, 'utf-8').toString('base64')}' | base64 -d > /etc/systemd/system/locust.service`,
-      'chmod 644 /etc/systemd/system/locust.service',
-      'systemctl daemon-reload',
-      'systemctl enable locust.service',
-      'systemctl start locust.service',
-    );
+      const locustUserData = ec2.UserData.forLinux();
+      locustUserData.addCommands(
+        'set -euxo pipefail',
+        // Isolated venv avoids pip trying to uninstall RPM-owned setuptools on the system interpreter.
+        // Locust pulls gevent etc.; wheels may fall back to source builds without a C toolchain.
+        'dnf -y install python3 python3-pip gcc make python3-devel openssl-devel',
+        'mkdir -p /opt/locust',
+        'python3 -m venv /opt/locust/venv',
+        '/opt/locust/venv/bin/pip install --upgrade pip',
+        '/opt/locust/venv/bin/pip install "locust>=2.24,<3"',
+        `echo "LOCUST_TARGET=http://${alb.loadBalancerDnsName}" > /opt/locust/locust.env`,
+        `echo '${Buffer.from(locustPy, 'utf-8').toString('base64')}' | base64 -d > /opt/locust/locustfile.py`,
+        `echo '${Buffer.from(locustSystemdUnit, 'utf-8').toString('base64')}' | base64 -d > /etc/systemd/system/locust.service`,
+        'chmod 644 /etc/systemd/system/locust.service',
+        'systemctl daemon-reload',
+        'systemctl enable locust.service',
+        'systemctl start locust.service',
+      );
 
-    // m5.large: ENA networking, up to 10 Gbps — plenty of headroom for ~1000 HTTP R/s with small payloads.
-    const locustDriver = new ec2.Instance(this, 'LocustDriver', {
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.M5, ec2.InstanceSize.LARGE),
-      machineImage: ec2.MachineImage.latestAmazonLinux2023(),
-      securityGroup: locustDriverSecurityGroup,
-      role: locustDriverRole,
-      associatePublicIpAddress: true,
-      userData: locustUserData,
-      requireImdsv2: true,
-    });
-    locustDriver.node.addDependency(alb);
+      // m5.large: ENA networking, up to 10 Gbps — plenty of headroom for ~1000 HTTP R/s with small payloads.
+      const locustDriver = new ec2.Instance(this, 'LocustDriver', {
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+        instanceType: ec2.InstanceType.of(ec2.InstanceClass.M5, ec2.InstanceSize.LARGE),
+        machineImage: ec2.MachineImage.latestAmazonLinux2023(),
+        securityGroup: locustDriverSecurityGroup,
+        role: locustDriverRole,
+        associatePublicIpAddress: true,
+        userData: locustUserData,
+        requireImdsv2: true,
+      });
+      locustDriver.node.addDependency(alb);
+
+      new cdk.CfnOutput(this, 'LocustInstancePublicDns', {
+        description: 'Locust driver — public DNS (add SG inbound for Locust port to open the web UI)',
+        value: locustDriver.instancePublicDnsName,
+      });
+
+      new cdk.CfnOutput(this, 'LocustWebPort', {
+        description: 'Locust web UI port on the driver instance',
+        value: String(locustWebPort),
+      });
+    }
 
     new cdk.CfnOutput(this, 'LoadBalancerDns', {
       description: 'Open in a browser to reach Apache via the ALB',
@@ -317,16 +373,6 @@ WantedBy=multi-user.target
       description:
         'SNS topic ARN — subscribe (email/SMS) for notifications when scale-out or scale-in alarms enter ALARM or OK',
       value: scalingAlarmsTopic.topicArn,
-    });
-
-    new cdk.CfnOutput(this, 'LocustInstancePublicDns', {
-      description: 'Locust driver — public DNS (add SG inbound for Locust port to open the web UI)',
-      value: locustDriver.instancePublicDnsName,
-    });
-
-    new cdk.CfnOutput(this, 'LocustWebPort', {
-      description: 'Locust web UI port on the driver instance',
-      value: String(locustWebPort),
     });
   }
 }
