@@ -6,62 +6,26 @@ AWS CDK (TypeScript) project that provisions a **demo HTTP stack**: an **Applica
 
 ## Architecture (ASCII)
 
-```
-                                    ┌─────────────────────────────────────────┐
-                                    │              Internet                    │
-                                    └──────────────────┬──────────────────────┘
-                                                       │
-                                                       │ HTTP :80
-                                                       v
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│  VPC (2 AZs, public subnets only, no NAT gateways)                                      │
-│                                                                                           │
-│   ┌─────────────────────┐         ┌──────────────────────┐         ┌──────────────────┐ │
-│   │  Locust driver EC2  │  HTTP   │  Application         │  HTTP   │  Auto Scaling    │ │
-│   │  m5.large           │────────>│  Load Balancer       │────────>│  Group           │ │
-│   │  :8089 web UI       │         │  (internet-facing)   │         │  t3.micro        │ │
-│   │  public IP          │         │  + listener :80      │         │  min 2 … max 10  │ │
-│   └─────────────────────┘         └──────────┬───────────┘         └────────┬─────────┘ │
-│          ^                                   │                            │          │
-│          │ SG: no inbound                     │                            │          │
-│          │ (you open :8089)                  v                            v          │
-│          │                         ┌──────────────────────┐      ┌──────────────────┐  │
-│          │                         │  Target group        │      │  EC2 instances   │  │
-│          │                         │  health: GET / 200   │<────>│  Apache :80      │  │
-│          │                         └──────────────────────┘      │  IMDSv2, SSM IAM │  │
-│          │                                                        └──────────────────┘  │
-└──────────┼────────────────────────────────────────────────────────────────────────────────┘
-           │
-           │  (same VPC; outbound to ALB allowed by default egress)
-           │
+**Where clients send traffic**
 
-                    ┌─────────────────────────────────────────┐
-                    │  Amazon CloudWatch                       │
-                    │  • Math metric: HTTP req/s per instance  │
-                    │    (from ALB RequestCountPerTarget)      │
-                    │  • Alarms: ≥50 scale out, ≤10 scale in   │
-                    │  • Dashboard: metric + in-service count  │
-                    └────────────┬───────────────┬────────────┘
-                                 │               │
-              step scaling       │               │ publish
-              policies           │               v
-                    ┌────────────v────────┐   ┌─────────────┐
-                    │  Auto Scaling      │   │  SNS topic  │
-                    │  +3 / -1 capacity  │   │  ALARM + OK │
-                    └────────────────────┘   └─────────────┘
-```
+- **Single stack** — HTTP to the stack output **LoadBalancerDns** (one regional ALB).
+- **Multi-region** (`-c multiRegion=true`) — HTTP to **WeightedDnsRecordFqdn**. **Route 53** publishes **weighted A alias** records (default **50 / 50**) toward each region’s ALB, each with an **HTTP health check** on the ALB (`GET /`). If checks fail for an endpoint, that weighted answer is **omitted**, so resolvers only return **healthy** regions—**DNS-level failover** (subject to TTL and health-check timing). The **global DNS** stack (`AutoscalingDemoGlobalDns`) is synthesized in **`dnsStackRegion`** (default: primary); health-check **CloudWatch metrics** are read from **us-east-1** regardless.
+
+![Architecture Diagram (simplified)](/img/architecture.png)
 
 **Traffic flow**
 
-1. Clients (browser, **Locust**, or `curl`) send **HTTP** to the **ALB DNS name** on port **80**.
-2. The ALB forwards to **healthy** instances in the **target group** (registered by the ASG).
-3. Each instance serves a small **HTML** page built at boot from **IMDS** (instance id + private DNS).
+1. **Single stack:** Clients (browser, **Locust**, or `curl`) send **HTTP** to the **ALB DNS name** on port **80**.
+2. **Multi-region:** Clients use the **global hostname**; **Route 53** returns A records for **healthy** regional ALBs only, then the same path as (1) inside that region’s VPC.
+3. The ALB forwards to **healthy** instances in the **target group** (registered by the ASG).
+4. Each instance serves a small **HTML** page built at boot from **IMDS** (instance id + private DNS).
 
 **Control plane**
 
-- **CloudWatch** evaluates a **math expression** on **ALB `RequestCountPerTarget`** (≈ load per healthy target, expressed as **requests per second**).
+- **CloudWatch** (in **each** regional stack) evaluates a **math expression** on **ALB `RequestCountPerTarget`** (≈ load per healthy target, expressed as **requests per second**).
 - **Two alarms** drive **step scaling** policies (**+3** capacity when sustained **≥ 50** req/s per target, **−1** when sustained **≤ 10**). Each alarm also **notifies an SNS topic** on **ALARM** and **OK**.
 - A **CloudWatch dashboard** (name matches stack output **DashboardName**, typically `YOUR-CDK-STACK-NAME-http-asg`) plots that metric and **`GroupInServiceInstances`**.
+- With **multi-region**, add **Route53HealthDashboardName** for **Route 53** health-check status / **% healthy** checkers per endpoint.
 
 ---
 
