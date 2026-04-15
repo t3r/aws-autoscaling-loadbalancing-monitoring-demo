@@ -5,6 +5,9 @@ import { ApacheBehindAlb } from './constructs/apache-behind-alb';
 import { DemoNetwork } from './constructs/demo-network';
 import { HttpScalingObservability } from './constructs/http-scaling-observability';
 import { LocustLoadGenerator } from './constructs/locust-load-generator';
+import { AUTOSCALING_DEMO_TRAINING_TAGS } from './training-tags';
+
+export { AUTOSCALING_DEMO_TRAINING_TAGS } from './training-tags';
 
 export interface AutoscalingDemoStackProps extends cdk.StackProps {
   /**
@@ -23,19 +26,14 @@ export class AutoscalingDemoStack extends cdk.Stack {
   public readonly webAlb: elbv2.ApplicationLoadBalancer;
 
   constructor(scope: Construct, id: string, props?: AutoscalingDemoStackProps) {
-    const trainingTags: Record<string, string> = {
-      't3r:training': 'lobster',
-      't3r:purpose': 'training',
-      't3r:remove-after': '2026-04-20',
-    };
     super(scope, id, {
       ...props,
-      tags: { ...trainingTags, ...props?.tags },
+      tags: { ...AUTOSCALING_DEMO_TRAINING_TAGS, ...props?.tags },
     });
 
     const enableLocustDriver = props?.enableLocustDriver !== false;
 
-    for (const [key, value] of Object.entries(trainingTags)) {
+    for (const [key, value] of Object.entries(AUTOSCALING_DEMO_TRAINING_TAGS)) {
       cdk.Tags.of(this).add(key, value, { applyToLaunchedInstances: true });
     }
 
